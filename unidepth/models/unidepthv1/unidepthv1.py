@@ -3,16 +3,16 @@ Author: Luigi Piccinelli
 Licensed under the CC-BY NC 4.0 license (http://creativecommons.org/licenses/by-nc/4.0/)
 """
 
+from math import ceil
 from copy import deepcopy
 import importlib
-from typing import Any, Dict, Tuple
-from math import ceil
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from einops import rearrange
+from huggingface_hub import PyTorchModelHubMixin
 
 from unidepth.utils.geometric import (
     generate_rays,
@@ -22,8 +22,6 @@ from unidepth.utils.misc import get_params
 from unidepth.utils.distributed import is_main_process
 from unidepth.utils.constants import IMAGENET_DATASET_MEAN, IMAGENET_DATASET_STD
 from unidepth.models.unidepthv1.decoder import Decoder
-
-from huggingface_hub import PyTorchModelHubMixin
 
 
 MAP_BACKBONES = {"ViTL14": "vitl14", "ConvNextL": "cnvnxtl"}
@@ -97,7 +95,13 @@ def _postprocess(predictions, intrinsics, shapes, pads, ratio, original_shapes):
     return predictions, intrinsics
 
 
-class UniDepthV1(nn.Module):
+class UniDepthV1(
+    nn.Module,
+    PyTorchModelHubMixin,
+    library_name="UniDepth",
+    repo_url="https://github.com/lpiccinelli-eth/UniDepth",
+    tags=["monocular-metric-depth-estimation"],
+):
     def __init__(
         self,
         config,
@@ -181,14 +185,14 @@ class UniDepthV1(nn.Module):
 
         # process image and intrinsiscs (if any) to match network input (slow?)
         if rgbs.max() > 5 or rgbs.dtype == torch.uint8:
+            rgbs = rgbs.to(torch.float32).div(255)
+        if rgbs.min() >= 0.0 and rgbs.max() <= 1.0:
             rgbs = TF.normalize(
-                rgbs.to(torch.float32).div(255),
+                rgbs,
                 mean=IMAGENET_DATASET_MEAN,
                 std=IMAGENET_DATASET_STD,
             )
-        else:
-            pass
-            # print("Image not normalized, was it already normalized?")
+
         (h, w), ratio = _shapes((H, W), self.image_shape)
         pad_left, pad_right, pad_top, pad_bottom = _paddings((h, w), self.image_shape)
         rgbs, gt_intrinsics = _preprocess(
@@ -296,28 +300,14 @@ class UniDepthV1(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    @classmethod
-    def from_pretrained(cls, backbone):
-        assert (
-            backbone in MAP_BACKBONES.keys()
-        ), f"backbone must be one of {list(MAP_BACKBONES.keys())}"
-        model = torch.hub.load(
-            "lpiccinelli-eth/UniDepth",
-            "UniDepth",
-            version="v1",
-            backbone=backbone,
-            pretrained=True,
-            trust_repo=True,
-        )
-        return model
-
-    def build(self, config: Dict[str, Dict[str, Any]]):
+    def build(self, config):
         mod = importlib.import_module("unidepth.models.encoder")
         pixel_encoder_factory = getattr(mod, config["model"]["pixel_encoder"]["name"])
         pixel_encoder_config = {
             **config["training"],
             **config["data"],
             **config["model"]["pixel_encoder"],
+            "interpolate_offset": 0.1
         }
         pixel_encoder = pixel_encoder_factory(pixel_encoder_config)
 
@@ -338,22 +328,3 @@ class UniDepthV1(nn.Module):
         self.pixel_encoder = pixel_encoder
         self.pixel_decoder = Decoder(config)
         self.image_shape = config["data"]["image_shape"]
-
-
-class UniDepthV1HF(
-    UniDepthV1,
-    PyTorchModelHubMixin,
-    library_name="UniDepth",
-    repo_url="https://github.com/lpiccinelli-eth/UniDepth",
-    tags=["monocular-metric-depth-estimation"]
-):
-    def __init__(self, config):
-        super().__init__(config)
-
-    @classmethod
-    def from_pretrained(cls, backbone, *args, **kwargs):
-        assert (
-            backbone in MAP_BACKBONES.keys()
-        ), f"backbone must be one of {list(MAP_BACKBONES.keys())}"
-        path = f"lpiccinelli/unidepth-v1-{MAP_BACKBONES[backbone]}"
-        return super(PyTorchModelHubMixin, cls).from_pretrained(path, *args, **kwargs)
